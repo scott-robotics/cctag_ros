@@ -5,7 +5,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
-#include "CmdLine.hpp"
 #include "cctag/Detection.hpp"
 #include "cctag/utils/Exceptions.hpp"
 #include "cctag/utils/FileDebug.hpp"
@@ -17,6 +16,8 @@
 #endif // CCTAG_WITH_CUDA
 
 #include <ros/ros.h>
+#include <sensor_msgs/Image.h>
+#include <cv_bridge/cv_bridge.h>
 
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/archive/xml_iarchive.hpp>
@@ -30,10 +31,6 @@
 #include <opencv2/imgproc/types_c.h>
 #include <opencv2/opencv.hpp>
 #include <opencv2/videoio.hpp>
-
-#ifdef USE_DEVIL
-#include <devil_cpp_wrapper.hpp>
-#endif
 
 #include <tbb/tbb.h>
 
@@ -102,7 +99,7 @@ void drawMarkers(const boost::ptr_list<CCTag>& markers, cv::Mat& image, bool sho
  *
  * @param[in] frameId The number of the frame.
  * @param[in] pipeId The pipe id (used for multiple streams).
- * @param[in] src The image to process.
+ * @param[in] cv_ptr->image The image to process.
  * @param[in] params The parameters for the detection.
  * @param[in] bank The marker bank.
  * @param[out] markers The list of detected markers.
@@ -183,381 +180,52 @@ void detection(std::size_t frameId,
 /*                    Main entry                             */
 
 /*************************************************************/
-int main(int argc, char** argv)
+
+void imageCallback(const sensor_msgs::ImageConstPtr& msg)
 {
-    CmdLine cmdline;
-
-    const std::string detectedSuffix{"_detected"};
-
-    if(!cmdline.parse(argc, argv))
-    {
-        cmdline.usage(argv[0]);
-        return EXIT_FAILURE;
-    }
-
-    cmdline.print(argv[0]);
-
-    bool useCamera = false;
-
-    // Check input path
-    if(!cmdline._filename.empty())
-    {
-        if(isInteger(cmdline._filename))
-        {
-            useCamera = true;
-        }
-        else if(!bfs::exists(cmdline._filename))
-        {
-            std::cerr << std::endl << "The input file \"" << cmdline._filename << "\" is missing" << std::endl;
-            return EXIT_FAILURE;
-        }
-    }
-    else
-    {
-        std::cerr << std::endl << "An input file is required" << std::endl;
-        cmdline.usage(argv[0]);
-        return EXIT_FAILURE;
-    }
-
-#ifdef CCTAG_WITH_CUDA
-    cctag::pop_cuda_only_sync_calls(cmdline._switchSync);
-#endif
-
-    // Check the (optional) parameters path
-    const std::size_t nCrowns = cmdline._nRings;
-    cctag::Parameters params(nCrowns);
-
-    if(!cmdline._paramsFilename.empty())
-    {
-        if(!bfs::exists(cmdline._paramsFilename))
-        {
-            std::cerr << std::endl << "The input file \"" << cmdline._paramsFilename << "\" is missing" << std::endl;
-            return EXIT_FAILURE;
-        }
-
-        // Read the parameter file provided by the user
-        std::ifstream ifs(cmdline._paramsFilename);
-        boost::archive::xml_iarchive ia(ifs);
-        try
-        {
-            ia >> boost::serialization::make_nvp("CCTagsParams", params);
-        }
-        catch(boost::archive::archive_exception& e)
-        {
-            std::cerr << std::endl << "Exception while reading parameter file: "
-                      << e.what() << std::endl;
-            return EXIT_FAILURE;
-        }
-        CCTAG_COUT(params._nCrowns);
-        CCTAG_COUT(nCrowns);
-        if(nCrowns != params._nCrowns)
-        {
-            std::cerr << std::endl
-                      << "The number of rings is inconsistent between the parameter file (" << params._nCrowns
-                      << ") and the command line (" << nCrowns << ")" << std::endl;
-            return EXIT_FAILURE;
-        }
-    }
-    else
-    {
-        // Use the default parameters and save them in defaultParameters.xml
-        cmdline._paramsFilename = "defaultParameters.xml";
-        std::ofstream ofs(cmdline._paramsFilename);
-        boost::archive::xml_oarchive oa(ofs);
-        oa << boost::serialization::make_nvp("CCTagsParams", params);
-        CCTAG_COUT("Parameter file not provided. Default parameters are used.");
-    }
+    cctag::Parameters params(3);
 
     CCTagMarkersBank bank(params._nCrowns);
-    if(!cmdline._cctagBankFilename.empty())
-    {
-        bank = CCTagMarkersBank(cmdline._cctagBankFilename);
-    }
 
-#ifdef CCTAG_WITH_CUDA
-    if(cmdline._useCuda)
-    {
-        params.setUseCuda(true);
-    }
-    else
-    {
-        params.setUseCuda(false);
-    }
+    cv_bridge::CvImagePtr cv_ptr;
+    cv::Mat display;
 
-    if(!cmdline._debugDir.empty())
+    try
     {
-        params.setDebugDir(cmdline._debugDir);
-    }
-
-    cctag::device_prop_t deviceInfo(false);
-#endif // CCTAG_WITH_CUDA
-
-    bfs::path myPath(bfs::absolute(cmdline._filename));
-    std::string ext(myPath.extension().string());
-    boost::algorithm::to_lower(ext);
-
-    const bfs::path parentPath(myPath.parent_path());
-    std::string outputFileName;
-    if(!bfs::is_directory(myPath))
-    {
-        CCTagVisualDebug::instance().initializeFolders(parentPath, cmdline._outputFolderName, params._nCrowns);
-        outputFileName =
-          parentPath.string() + "/" + cmdline._outputFolderName + "/cctag" + std::to_string(nCrowns) + "CC.out";
-    }
-    else
-    {
-        CCTagVisualDebug::instance().initializeFolders(myPath, cmdline._outputFolderName, params._nCrowns);
-        outputFileName =
-          myPath.string() + "/" + cmdline._outputFolderName + "/cctag" + std::to_string(nCrowns) + "CC.out";
-    }
-    std::ofstream outputFile;
-    outputFile.open(outputFileName);
-
-#if USE_DEVIL
-    if((ext == ".bmp") || (ext == ".gif") || (ext == ".jpg") || (ext == ".lbm") || (ext == ".pbm") || (ext == ".pgm") ||
-       (ext == ".png") || (ext == ".ppm") || (ext == ".tga") || (ext == ".tif"))
-    {
-        std::cout << "******************* Image mode **********************" << std::endl;
-        POP_INFO("looking at image " << myPath.string());
-        ilImage img;
-        if(img.Load(cmdline._filename.c_str()) == false)
+        cv_ptr = cv_bridge::toCvCopy(msg, msg->encoding);
+        if(cv_ptr->image.channels() != 1)
         {
-            std::cerr << "Could not load image " << cmdline._filename << std::endl;
-            return 0;
-        }
-        if(img.Convert(IL_LUMINANCE) == false)
+            display = cv_ptr->image;
+            cv::cvtColor(cv_ptr->image, cv_ptr->image, CV_BGR2GRAY);
+            ROS_INFO("gray");
+        } else
         {
-            std::cerr << "Failed converting image " << cmdline._filename << " to unsigned greyscale image" << std::endl;
-            exit(-1);
-        }
-        int w = img.Width();
-        int h = img.Height();
-        std::cout << "Loading " << w << " x " << h << " image " << cmdline._filename << std::endl;
-        unsigned char* image_data = img.GetData();
-        cv::Mat graySrc = cv::Mat(h, w, CV_8U, image_data);
-
-        imwrite("ballo.jpg", graySrc);
-
-        const int pipeId = 0;
-        boost::ptr_list<CCTag> markers;
-#ifdef PRINT_TO_CERR
-        detection(0, pipeId, graySrc, params, bank, markers, std::cerr, myPath.stem().string());
-#else  // PRINT_TO_CERR
-        detection(0, pipeId, graySrc, params, bank, markers, outputFile, myPath.stem().string());
-#endif // PRINT_TO_CERR
-    }
-#else // USE_DEVIL
-    if((ext == ".png") || (ext == ".jpg") || (ext == ".tif") || (ext == ".tiff"))
-    {
-        std::cout << "******************* Image mode **********************" << std::endl;
-
-        POP_INFO("looking at image " << myPath.string());
-
-        // Gray scale conversion
-        cv::Mat src = cv::imread(cmdline._filename);
-        cv::Mat graySrc;
-        cv::cvtColor(src, graySrc, CV_BGR2GRAY);
-
-        const std::string windowName = "Detection result";
-        cv::namedWindow(windowName, cv::WINDOW_NORMAL);
-        const int delay = -1;
-
-        const int pipeId = 0;
-        boost::ptr_list<CCTag> markers;
-#ifdef PRINT_TO_CERR
-        detection(0, pipeId, graySrc, params, bank, markers, std::cerr, myPath.stem().string());
-#else  // PRINT_TO_CERR
-        detection(0, pipeId, graySrc, params, bank, markers, outputFile, myPath.stem().string());
-#endif // PRINT_TO_CERR
-
-        // if the original image is b/w convert it to BGRA so we can draw colors
-        if(src.channels() == 1)
-            cv::cvtColor(graySrc, src, cv::COLOR_GRAY2BGRA);
-
-        drawMarkers(markers, src, cmdline._showUnreliableDetections);
-        cv::imshow(windowName, src);
-        cv::waitKey(delay);
-        if(cmdline._saveDetectedImage)
-        {
-            auto saveFilename = bfs::path(myPath.filename().stem().string() + detectedSuffix + ext);
-            if(!cmdline._outputFolderName.empty())
-            {
-                saveFilename = bfs::path(cmdline._outputFolderName) / saveFilename;
-            }
-            cv::imwrite(saveFilename.string(), src);
+            cv::cvtColor(cv_ptr->image, display, cv::COLOR_GRAY2BGRA);
         }
     }
-#endif // USE_DEVIL
-    else if(ext == ".avi" || ext == ".mov" || useCamera)
+    catch (cv_bridge::Exception& e)
     {
-        CCTAG_COUT("*** Video mode ***");
-        POP_INFO("looking at video " << myPath.string());
-
-        // open video and check
-        cv::VideoCapture video;
-        if(useCamera)
-            video.open(std::atoi(cmdline._filename.c_str()));
-        else
-            video.open(cmdline._filename);
-
-        if(!video.isOpened())
-        {
-            CCTAG_COUT("Unable to open the video : " << cmdline._filename);
-            return EXIT_FAILURE;
-        }
-
-        const std::string windowName = "Detection result";
-        cv::namedWindow(windowName, cv::WINDOW_NORMAL);
-
-        std::cerr << "Starting to read video frames" << std::endl;
-        std::size_t frameId = 0;
-
-        // time to wait in milliseconds for keyboard input, used to switch from
-        // live to debug mode
-        int delay = 10;
-
-        while(true)
-        {
-            cv::Mat frame;
-            video >> frame;
-            if(frame.empty())
-                break;
-
-            cv::Mat imgGray;
-
-            if(frame.channels() == 3 || frame.channels() == 4)
-                cv::cvtColor(frame, imgGray, cv::COLOR_BGR2GRAY);
-            else
-                frame.copyTo(imgGray);
-
-            // Set the output folder
-            std::stringstream outFileName;
-            outFileName << std::setfill('0') << std::setw(5) << frameId;
-
-            boost::ptr_list<CCTag> markers;
-
-            // Invert the image for the projection scenario
-            // cv::Mat imgGrayInverted;
-            // bitwise_not ( imgGray, imgGrayInverted );
-
-            // Call the CCTag detection
-            const int pipeId = 0;
-#ifdef PRINT_TO_CERR
-            detection(frameId, pipeId, imgGray, params, bank, markers, std::cerr, outFileName.str());
-#else
-            detection(frameId, pipeId, imgGray, params, bank, markers, outputFile, outFileName.str());
-#endif
-
-            // if the original image is b/w convert it to BGRA so we can draw colors
-            if(frame.channels() == 1)
-                cv::cvtColor(imgGray, frame, cv::COLOR_GRAY2BGRA);
-
-            drawMarkers(markers, frame, cmdline._showUnreliableDetections);
-            cv::imshow(windowName, frame);
-
-            if(cmdline._saveDetectedImage)
-            {
-                auto saveFilename = bfs::path(outputFileName + ".png");
-                if(!cmdline._outputFolderName.empty())
-                {
-                    saveFilename = bfs::path(cmdline._outputFolderName) / saveFilename;
-                }
-                cv::imwrite(saveFilename.string(), frame);
-            }
-
-            if(cv::waitKey(delay) == 27)
-                break;
-            char key = (char)cv::waitKey(delay);
-            // stop capturing by pressing ESC
-            if(key == 27)
-                break;
-            if(key == 'l' || key == 'L')
-                delay = 10;
-            // delay = 0 will wait for a key to be pressed
-            if(key == 'd' || key == 'D')
-                delay = 0;
-
-            ++frameId;
-        }
+        ROS_ERROR("cv_bridge exception: %s", e.what());
+        return;
     }
-    else if(bfs::is_directory(myPath))
-    {
-        CCTAG_COUT("*** Image sequence mode ***");
 
-        std::vector<bfs::path> vFileInFolder;
+    boost::ptr_list<CCTag> markers;
+    detection(msg->header.seq, 0, cv_ptr->image, params, bank, markers, std::cerr);
 
-        std::copy(bfs::directory_iterator(myPath),
-                  bfs::directory_iterator(),
-                  std::back_inserter(vFileInFolder)); // is directory_entry, which is
-        std::sort(vFileInFolder.begin(), vFileInFolder.end());
+    drawMarkers(markers, display, true);
+    cv::imshow("Detections", display);
+    cv::waitKey(100);
+}
 
-        std::size_t frameId = 0;
 
-        std::map<int, bfs::path> files[2];
-        for(const auto& fileInFolder : vFileInFolder)
-        {
-            files[frameId & 1].insert(std::pair<int, bfs::path>(frameId, fileInFolder));
-            frameId++;
-        }
+int main(int argc, char** argv)
+{
+    ros::init(argc, argv, "cctag");
 
-        tbb::parallel_for(0, 2, [&](size_t fileListIdx) {
-            for(const auto& fileInFolder : files[fileListIdx])
-            {
-                const std::string subExt(bfs::extension(fileInFolder.second));
+    ros::NodeHandle pnh("~");
+    ros::Subscriber image_sub = pnh.subscribe("/camera1/infra1/image_rect_raw", 1, imageCallback);
 
-                if((subExt == ".png") || (subExt == ".jpg") || (subExt == ".PNG") || (subExt == ".JPG"))
-                {
-                    const auto inputImageFile = fileInFolder.second;
-                    std::cerr << "Processing image " << inputImageFile << std::endl;
+    ros::spin();
 
-                    cv::Mat src;
-                    src = cv::imread(inputImageFile.string());
-
-                    cv::Mat imgGray;
-                    cv::cvtColor(src, imgGray, CV_BGR2GRAY);
-
-                    // Call the CCTag detection
-                    int pipeId = (fileInFolder.first & 1);
-                    boost::ptr_list<CCTag> markers;
-#ifdef PRINT_TO_CERR
-                    detection(fileInFolder.first,
-                              pipeId,
-                              imgGray,
-                              params,
-                              bank,
-                              markers,
-                              std::cerr,
-                              inputImageFile.stem().string());
-#else
-          detection(fileInFolder.first, pipeId, imgGray, params, bank, markers, outputFile, inputImageFile.second.stem().string());
-#endif
-                    // if the original image is b/w convert it to BGRA so we can draw colors
-                    if(src.channels() == 1)
-                        cv::cvtColor(imgGray, src, cv::COLOR_GRAY2BGRA);
-
-                    drawMarkers(markers, src, cmdline._showUnreliableDetections);
-                    if(cmdline._saveDetectedImage)
-                    {
-                        // get the filename without extension and add the suffix
-                        auto saveFilename =
-                          bfs::path(inputImageFile.filename().stem().string() + detectedSuffix + subExt);
-                        if(!cmdline._outputFolderName.empty())
-                        {
-                            saveFilename = bfs::path(cmdline._outputFolderName) / saveFilename;
-                        }
-                        cv::imwrite(saveFilename.string(), src);
-                    }
-
-                    std::cerr << "Done processing image " << fileInFolder.second.string() << std::endl;
-                }
-            }
-        });
-    }
-    else
-    {
-        std::cerr << "The input file format is not supported" << std::endl;
-        throw std::logic_error("Unrecognized input.");
-    }
-    outputFile.close();
-    return EXIT_SUCCESS;
+    return 0;
 }

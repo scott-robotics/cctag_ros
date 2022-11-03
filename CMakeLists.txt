@@ -18,6 +18,8 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   std_msgs
   geometry_msgs
+  sensor_msgs
+  cv_bridge
 )
 
 set(CMAKE_BUILD_TYPE "RelWithDebInfo")
@@ -67,6 +69,7 @@ target_link_libraries(cctag_ros
   TBB::tbb
   ${OpenCV_LIBRARIES}
   Boost::filesystem Boost::program_options Boost::timer
+  ${catkin_LIBRARIES}
   )
 
 #############

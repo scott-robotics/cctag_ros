@@ -34,7 +34,7 @@ catkin_package(
 ###########
 ## Build ##
 ###########
-add_definitions(-DCCTAG_WITH_CUDA)
+#add_definitions(-DCCTAG_WITH_CUDA)
 add_subdirectory(CCTag)
 
 ## Specify additional locations of header files

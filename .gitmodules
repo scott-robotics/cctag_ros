@@ -1,0 +1,4 @@
+[submodule "CCTag"]
+	path = CCTag
+	url = git@github.com:alicevision/CCTag.git
+	branch = develop
